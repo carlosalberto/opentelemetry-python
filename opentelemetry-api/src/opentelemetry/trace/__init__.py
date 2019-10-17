@@ -443,13 +443,12 @@ class Tracer:
         # pylint: disable=unused-argument,no-self-use
         return INVALID_SPAN
 
-    @contextmanager  # type: ignore
     def start_as_current_span(
         self,
         name: str,
         parent: ParentSpan = CURRENT_SPAN,
         kind: SpanKind = SpanKind.INTERNAL,
-    ) -> typing.Iterator["Span"]:
+    ) -> typing.ContextManager["Span"]:
         """Context manager for creating a new span and set it
         as the current span in this tracer's context.
 
@@ -490,7 +489,7 @@ class Tracer:
         """
 
         # pylint: disable=unused-argument,no-self-use
-        yield INVALID_SPAN
+        return INVALID_SPAN
 
     def create_span(
         self,
@@ -533,10 +532,9 @@ class Tracer:
         # pylint: disable=unused-argument,no-self-use
         return INVALID_SPAN
 
-    @contextmanager  # type: ignore
     def use_span(
         self, span: "Span", end_on_exit: bool = False
-    ) -> typing.Iterator[None]:
+    ) -> typing.ContextManager["Span"]:
         """Context manager for controlling a span's lifetime.
 
         Set the given span as the current span in this tracer's context.
@@ -552,7 +550,7 @@ class Tracer:
                 context manager.
         """
         # pylint: disable=unused-argument,no-self-use
-        yield
+        return INVALID_SPAN
 
 
 # Once https://github.com/python/mypy/issues/7092 is resolved,
