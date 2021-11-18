@@ -86,6 +86,7 @@ API
 # pylint:disable=no-member
 
 import logging
+from threading import Lock
 from types import TracebackType
 from typing import Optional, Type, TypeVar, Union
 
@@ -147,6 +148,27 @@ def create_tracer(otel_tracer_provider: TracerProvider) -> "TracerShim":
     return TracerShim(otel_tracer_provider.get_tracer(__name__, __version__))
 
 
+def get_baggage_from_otel_span(span):
+    _check_ot_shim_data(span)
+    with span._ot_shim_lock:
+        return span._ot_shim_baggage
+
+def set_baggage_for_otel_span(span, key, value):
+    _check_ot_shim_data(span)
+    with span._ot_shim_lock:
+        span._ot_shim_baggage = set_baggage(
+                key,
+                value,
+                span._ot_shim_baggage)
+
+# TODO: Potential race condition setting the lock AND the baggage
+# for the first time.
+def _check_ot_shim_data(span):
+    if not hasattr(span, '_ot_shim_lock'):
+        span._ot_shim_lock = Lock()
+        span._ot_shim_baggage = Context()
+
+
 class SpanContextShim(SpanContext):
     """Implements :class:`opentracing.SpanContext` by wrapping a
     :class:`opentelemetry.trace.SpanContext` object.
@@ -156,10 +178,10 @@ class SpanContextShim(SpanContext):
             constructing the :class:`SpanContextShim`.
     """
 
-    def __init__(self, otel_context: OtelSpanContext):
+    def __init__(self, otel_context: OtelSpanContext, baggage=Context()):
         self._otel_context = otel_context
         # Context is being used here since it must be immutable.
-        self._baggage = Context()
+        self._baggage = baggage
 
     def unwrap(self) -> OtelSpanContext:
         """Returns the wrapped :class:`opentelemetry.trace.SpanContext`
@@ -189,8 +211,8 @@ class SpanShim(Span):
         span: A :class:`opentelemetry.trace.Span` to wrap.
     """
 
-    def __init__(self, tracer, context: SpanContextShim, span):
-        super().__init__(tracer, context)
+    def __init__(self, tracer, span):
+        super().__init__(tracer, None)
         self._otel_span = span
 
     def unwrap(self):
@@ -202,6 +224,15 @@ class SpanShim(Span):
         """
 
         return self._otel_span
+
+    # TODO: Cache/store the full SpanContextShim object,
+    # as Java does.
+    @property
+    def context(self):
+        return SpanContextShim(
+            self._otel_span.get_span_context(),
+            get_baggage_from_otel_span(self._otel_span),
+        )
 
     def set_operation_name(self, operation_name: str) -> "SpanShim":
         """Updates the name of the wrapped OpenTelemetry span.
@@ -300,9 +331,8 @@ class SpanShim(Span):
             value: A tag value.
         """
         # pylint: disable=protected-access
-        self._context._baggage = set_baggage(
-            key, value, context=self._context._baggage
-        )
+        set_baggage_for_otel_span(
+            self._otel_span, key, value)
 
     def get_baggage_item(self, key: str) -> Optional[object]:
         """Retrieves value of the baggage item with the given key.
@@ -313,7 +343,8 @@ class SpanShim(Span):
             Returns this :class:`SpanShim` instance to allow call chaining.
         """
         # pylint: disable=protected-access
-        return get_baggage(key, context=self._context._baggage)
+        return get_baggage(key,
+            get_baggage_from_otel_span(self._otel_span))
 
 
 class ScopeShim(Scope):
@@ -388,8 +419,7 @@ class ScopeShim(Scope):
         """
 
         otel_span = span_cm.__enter__()
-        span_context = SpanContextShim(otel_span.get_span_context())
-        span = SpanShim(manager.tracer, span_context, otel_span)
+        span = SpanShim(manager.tracer, otel_span)
         return cls(manager, span, span_cm)
 
     def close(self):
@@ -496,8 +526,7 @@ class ScopeManagerShim(ScopeManager):
         try:
             return get_value(_SHIM_KEY)
         except KeyError:
-            span_context = SpanContextShim(span.get_span_context())
-            wrapped_span = SpanShim(self._tracer, span_context, span)
+            wrapped_span = SpanShim(self._tracer, span)
             return ScopeShim(self, span=wrapped_span)
 
     @property
@@ -596,7 +625,7 @@ class TracerShim(Tracer):
             child_of is None
             and current_span.get_span_context() is not INVALID_SPAN_CONTEXT
         ):
-            child_of = SpanShim(None, None, current_span)
+            child_of = SpanShim(None, current_span)
 
         span = self.start_span(
             operation_name=operation_name,
@@ -678,8 +707,7 @@ class TracerShim(Tracer):
             start_time=start_time_ns,
         )
 
-        context = SpanContextShim(span.get_span_context())
-        return SpanShim(self, context, span)
+        return SpanShim(self, span)
 
     def inject(self, span_context, format: object, carrier: object):
         """Injects ``span_context`` into ``carrier``.

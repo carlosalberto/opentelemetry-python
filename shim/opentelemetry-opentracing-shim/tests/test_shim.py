@@ -16,6 +16,7 @@
 # pylint:disable=no-member
 
 import time
+import threading
 import traceback
 from unittest import TestCase
 from unittest.mock import Mock
@@ -43,6 +44,8 @@ class TestShim(TestCase):
     def setUp(self):
         """Create an OpenTelemetry tracer and a shim before every test case."""
         trace.set_tracer_provider(TracerProvider())
+        # TODO: Unify the names or expose the Tracer in the Shim
+        self.otel_tracer = trace.get_tracer_provider().get_tracer('test')
         self.shim = create_tracer(trace.get_tracer_provider())
 
     @classmethod
@@ -618,11 +621,46 @@ class TestShim(TestCase):
         with self.assertRaises(ValueError):
             baggage[1] = 3
 
+        '''
+        TODO: Fix this test, as baggage is immutable at SpanContext level
+        in OpenTracing.
         span_shim = SpanShim(Mock(), span_context_shim, Mock())
 
         span_shim.set_baggage_item(1, 2)
 
         self.assertTrue(span_shim.get_baggage_item(1), 2)
+        '''
+
+    def test_baggage_different_shim_objs(self):
+        span = self.shim.start_span('One')
+        span.set_baggage_item('key1', 'value1')
+
+        span2 = SpanShim(self.otel_tracer, span.unwrap())
+        span2.set_baggage_item('key1', 'value2')
+
+        self.assertEqual(span.get_baggage_item('key1'), 'value2')
+        self.assertEqual(span2.get_baggage_item('key1'), 'value2')
+        self.assertEqual(span.context.baggage, span2.context.baggage)
+
+    def test_baggage_different_threads(self):
+        span = self.shim.start_span('One')
+
+        def small_task(id, otel_span):
+                SpanShim(self.otel_tracer, otel_span).set_baggage_item(
+                        'key' + str(id), 'value' + str(id))
+
+        threads = []
+        for i in range(0, 3):
+            t = threading.Thread(target=small_task, args=(i, span.unwrap()))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        self.assertEqual(span.get_baggage_item('key0'), 'value0')
+        self.assertEqual(span.get_baggage_item('key1'), 'value1')
+        self.assertEqual(span.get_baggage_item('key2'), 'value2')
 
     def test_active(self):
         """Test that the active property and start_active_span return the same
