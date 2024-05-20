@@ -17,13 +17,16 @@
 
 import time
 import traceback
+import typing
 from unittest import TestCase
 from unittest.mock import Mock
 
 import opentracing
 
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.propagate import get_global_textmap, set_global_textmap
+from opentelemetry.propagators import textmap
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.shim.opentracing_shim import (
     SpanContextShim,
@@ -550,6 +553,35 @@ class TestShim(TestCase):
             text_map[MockTextMapPropagator.SPAN_ID_KEY], str(7478)
         )
 
+    def test_inject_custom_propagator(self):
+        """Test `inject()` method for Format.TEXT_MAP and Format.HTTP_HEADERS using custom propagators"""
+
+        otel_context = trace.SpanContext(
+            trace_id=1220, span_id=7478, is_remote=False
+        )
+        context = SpanContextShim(otel_context)
+
+        prop1 = FixedIdsPropagator(12345, 67890)
+        prop2 = FixedIdsPropagator(67890, 12345)
+        shim = create_tracer(TracerProvider(), prop1, prop2)
+
+        text_map = {}
+        shim.inject(context, opentracing.Format.TEXT_MAP, text_map)
+        self.assertEqual(
+            text_map[FixedIdsPropagator.TRACE_ID_KEY], str(12345)
+        )
+        self.assertEqual(
+            text_map[FixedIdsPropagator.SPAN_ID_KEY], str(67890)
+        )
+        text_map = {}
+        shim.inject(context, opentracing.Format.HTTP_HEADERS, text_map)
+        self.assertEqual(
+            text_map[FixedIdsPropagator.TRACE_ID_KEY], str(67890)
+        )
+        self.assertEqual(
+            text_map[FixedIdsPropagator.SPAN_ID_KEY], str(12345)
+        )
+
     def test_inject_binary(self):
         """Test `inject()` method for Format.BINARY."""
 
@@ -599,6 +631,21 @@ class TestShim(TestCase):
         ctx = self.shim.extract(opentracing.Format.TEXT_MAP, carrier)
         self.assertEqual(ctx.unwrap().trace_id, 1220)
         self.assertEqual(ctx.unwrap().span_id, 7478)
+
+    def test_extract_custom_propagator(self):
+        """Test `extract()` method for Format.TEXT_MAP and Format.HTTP_HEADERS using custom propagators"""
+
+        prop1 = FixedIdsPropagator(12345, 67890)
+        prop2 = FixedIdsPropagator(67890, 12345)
+        shim = create_tracer(TracerProvider(), prop1, prop2)
+
+        ctx = shim.extract(opentracing.Format.TEXT_MAP, {})
+        self.assertEqual(ctx.unwrap().trace_id, 12345)
+        self.assertEqual(ctx.unwrap().span_id, 67890)
+
+        ctx = shim.extract(opentracing.Format.HTTP_HEADERS, {})
+        self.assertEqual(ctx.unwrap().trace_id, 67890)
+        self.assertEqual(ctx.unwrap().span_id, 12345)
 
     def test_extract_binary(self):
         """Test `extract()` method for Format.BINARY."""
@@ -672,3 +719,49 @@ class TestShim(TestCase):
                     scope.span.unwrap().parent,
                     opentelemetry_span.context,
                 )
+
+
+class FixedIdsPropagator(textmap.TextMapPropagator):
+
+    TRACE_ID_KEY = "custom-trace-id"
+    SPAN_ID_KEY = "custom-span-id"
+
+    def __init__(self, trace_id, span_id):
+        self.trace_id = trace_id
+        self.span_id = span_id
+
+    def inject(
+        self,
+        carrier: textmap.CarrierT,
+        context: typing.Optional[Context] = None,
+        setter: textmap.Setter = textmap.default_setter,
+    ) -> None:
+        setter.set(carrier, FixedIdsPropagator.TRACE_ID_KEY, str(self.trace_id))
+        setter.set(carrier, FixedIdsPropagator.SPAN_ID_KEY, str(self.span_id))
+
+    def extract(
+        self,
+        carrier: textmap.CarrierT,
+        context: typing.Optional[Context] = None,
+        getter: textmap.Getter = textmap.default_getter,
+    ) -> Context:
+
+        return trace.set_span_in_context(
+            trace.NonRecordingSpan(
+                trace.SpanContext(
+                    trace_id=self.trace_id,
+                    span_id=self.span_id,
+                    is_remote=True,
+                    trace_flags=trace.TraceFlags.get_default(),
+                    trace_state=trace.TraceState(),
+                )
+            ),
+            context,
+        )
+
+    @property
+    def fields(self) -> typing.Set[str]:
+        return {
+            self.TRACE_ID_KEY,
+            self.SPAN_ID_KEY,
+        }

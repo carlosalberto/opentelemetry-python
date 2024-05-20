@@ -35,11 +35,8 @@ following example::
     # Define which OpenTelemetry Tracer provider implementation to use.
     trace.set_tracer_provider(TracerProvider())
 
-    # Create an OpenTelemetry Tracer.
-    otel_tracer = trace.get_tracer(__name__)
-
     # Create an OpenTracing shim.
-    shim = create_tracer(otel_tracer)
+    shim = create_tracer(trace.get_tracer_provider())
 
     with shim.start_active_span("ProcessHTTPRequest"):
         print("Processing HTTP request")
@@ -110,6 +107,7 @@ from opentelemetry.context import (
     set_value,
 )
 from opentelemetry.propagate import get_global_textmap
+from opentelemetry.propagators import textmap
 from opentelemetry.shim.opentracing_shim import util
 from opentelemetry.shim.opentracing_shim.version import __version__
 from opentelemetry.trace import INVALID_SPAN_CONTEXT, Link, NonRecordingSpan
@@ -126,9 +124,14 @@ from opentelemetry.util.types import Attributes
 ValueT = TypeVar("ValueT", int, float, bool, str)
 logger = logging.getLogger(__name__)
 _SHIM_KEY = create_key("scope_shim")
+_TRACER_NAME = "opentracing-shim"
 
 
-def create_tracer(otel_tracer_provider: TracerProvider) -> "TracerShim":
+def create_tracer(
+    otel_tracer_provider: TracerProvider,
+    textmap_propagator: textmap.TextMapPropagator = None,
+    httpheaders_propagator: textmap.TextMapPropagator = None,
+) -> "TracerShim":
     """Creates a :class:`TracerShim` object from the provided OpenTelemetry
     :class:`opentelemetry.trace.TracerProvider`.
 
@@ -139,12 +142,22 @@ def create_tracer(otel_tracer_provider: TracerProvider) -> "TracerShim":
         otel_tracer_provider: A tracer from this provider  will be used to
             perform the actual tracing when user code is instrumented using the
             OpenTracing API.
+        textmap_propagator: An optional TextMap propagator to be used when
+            opentracing.Format.TEXT_MAP is specified during injection and extraction.
+            Defaults to the global textmap propagator.
+        httpheaders_propagator: An optional TextMap propagator to be used when
+            opentracing.Format.HTTP_HEADERS is specified during injection and extraction.
+            Defaults to the global textmap propagator.
 
     Returns:
         The created :class:`TracerShim`.
     """
 
-    return TracerShim(otel_tracer_provider.get_tracer(__name__, __version__))
+    return TracerShim(
+        otel_tracer_provider.get_tracer(_TRACER_NAME, __version__),
+        textmap_propagator,
+        httpheaders_propagator,
+    )
 
 
 class SpanContextShim(SpanContext):
@@ -537,13 +550,16 @@ class TracerShim(Tracer):
             tracer will be invoked by the shim to create actual spans.
     """
 
-    def __init__(self, tracer: OtelTracer):
+    def __init__(
+        self,
+        tracer: OtelTracer,
+        textmap_propagator: textmap.TextMapPropagator = None,
+        headers_propagator: textmap.TextMapPropagator = None,
+    ):
         super().__init__(scope_manager=ScopeManagerShim(self))
         self._otel_tracer = tracer
-        self._supported_formats = (
-            Format.TEXT_MAP,
-            Format.HTTP_HEADERS,
-        )
+        self._textmap_propagator = textmap_propagator
+        self._headers_propagator = headers_propagator
 
     def unwrap(self):
         """Returns the :class:`opentelemetry.trace.Tracer` object that is
@@ -695,17 +711,7 @@ class TracerShim(Tracer):
             carrier: the format-specific carrier object to inject into
         """
 
-        # pylint: disable=redefined-builtin
-        # This implementation does not perform the injecting by itself but
-        # uses the configured propagators in opentelemetry.propagators.
-        # TODO: Support Format.BINARY once it is supported in
-        # opentelemetry-python.
-
-        if format not in self._supported_formats:
-            raise UnsupportedFormatException
-
-        propagator = get_global_textmap()
-
+        propagator = self._get_propagator(format)
         span = span_context.unwrap() if span_context else None
         if isinstance(span, OtelSpanContext):
             span = NonRecordingSpan(span)
@@ -730,15 +736,7 @@ class TracerShim(Tracer):
             ``None`` if no such ``SpanContext`` could be found.
         """
 
-        # pylint: disable=redefined-builtin
-        # This implementation does not perform the extracting by itself but
-        # uses the configured propagators in opentelemetry.propagators.
-        # TODO: Support Format.BINARY once it is supported in
-        # opentelemetry-python.
-        if format not in self._supported_formats:
-            raise UnsupportedFormatException
-
-        propagator = get_global_textmap()
+        propagator = self._get_propagator(format)
         ctx = propagator.extract(carrier)
         span = get_current_span(ctx)
         if span is not None:
@@ -747,3 +745,26 @@ class TracerShim(Tracer):
             otel_context = INVALID_SPAN_CONTEXT
 
         return SpanContextShim(otel_context)
+
+    def _get_propagator(self, format):
+        # pylint: disable=redefined-builtin
+        # This implementation does not perform the injecting by itself but
+        # uses the configured propagators in opentelemetry.propagators.
+        # TODO: Support Format.BINARY once it is supported in
+        # opentelemetry-python.
+
+        propagator = get_global_textmap()
+        if format is Format.TEXT_MAP:
+            return (
+                propagator
+                if self._textmap_propagator is None
+                else self._textmap_propagator
+            )
+        elif format is Format.HTTP_HEADERS:
+            return (
+                propagator
+                if self._headers_propagator is None
+                else self._headers_propagator
+            )
+
+        raise UnsupportedFormatException
